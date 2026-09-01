@@ -2,8 +2,17 @@
   "comparison": {
     "emDifferenceFirstMinusSecond": {
       "lower95Points": -3.0,
+      "method": "paired percentile bootstrap stratified by context-length band",
       "observedPoints": 1.6666666666666667,
+      "quantileDefinition": "Hyndman-Fan type 7 linear interpolation",
+      "resampleUnit": "example within stratum",
       "resamples": 10000,
+      "seed": 20260722,
+      "stratumSampleSizes": {
+        "long": 100,
+        "medium": 100,
+        "short": 100
+      },
       "upper95Points": 6.333333333333333
     },
     "emWinSignTestPValue": 0.5758493477318467,
@@ -13,10 +22,19 @@
       "tie": 249
     },
     "f1DifferenceFirstMinusSecond": {
-      "lower95Points": -2.4442097469681867,
+      "lower95Points": -2.4659375225371143,
+      "method": "paired percentile bootstrap stratified by context-length band",
       "observedPoints": 0.28037670241297635,
+      "quantileDefinition": "Hyndman-Fan type 7 linear interpolation",
+      "resampleUnit": "example within stratum",
       "resamples": 10000,
-      "upper95Points": 2.9988675953705775
+      "seed": 20260721,
+      "stratumSampleSizes": {
+        "long": 100,
+        "medium": 100,
+        "short": 100
+      },
+      "upper95Points": 2.956811987287845
     },
     "f1WinSignTestPValue": 0.613734467630139,
     "f1Wins": {
@@ -27,12 +45,19 @@
     "first": "W8_ANE",
     "identicalPredictions": 187,
     "pairedSamples": 300,
-    "second": "INT4_GPU"
+    "second": "INT4_GPU",
+    "signTest": {
+      "emPValue": 0.5758493477318467,
+      "f1PValue": 0.613734467630139,
+      "method": "exact two-sided paired sign test",
+      "tiesExcluded": true
+    }
   },
   "equivalenceEstablished": false,
-  "metric": "CMRC2018 official EM/F1 formula; NLTK Treebank tokenizer without sentence splitting",
-  "schemaVersion": 1,
-  "sourceQualitySHA256": "47bae909fdac3e80996b4042daff173931dec306c6f8a9977189792f4effa171",
+  "metric": "Documented Python 3 adaptation of the official CMRC2018 EM/F1 formula; NLTK Treebank tokenization without sentence splitting",
+  "paperAnalysisSHA256": "5fe4f49e892721e9841c697922250691705103619ada3941b2087269e58085c5",
+  "publishedQualitySHA256": "47bae909fdac3e80996b4042daff173931dec306c6f8a9977189792f4effa171",
+  "schemaVersion": 2,
   "variants": {
     "INT4_GPU": {
       "byStratum": {

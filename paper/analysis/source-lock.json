@@ -5,6 +5,80 @@
     "python": "3.11.15",
     "nltk": "3.10.0"
   },
+  "localFiles": {
+    "results/fidelity-v2-summary.json": "fa2ef349a04d26cdb09686f9eb53c925b9c72c68ca7a04b1f89bbc96fcdd6cca",
+    "results/w8-aot-compatibility-evidence.json": "baf1e717e445a56108350066cac983ad1cd0f0941af0467da7260bbc341ca68d",
+    "paper/REPORT_PROTOCOL_V2.md": "b54284270c9f9fff14beadb8f5dca01d012b0585f887c0f6f30a729bc076587f",
+    "paper/W8_COMPATIBILITY_OBSERVATION_1.md": "f5405f6adf8a2556f2ad95ee0291426dadd885e0de9f540f31e2d9f34dd67a79",
+    "paper/evidence/w8-compatibility/sanitized-load-events.jsonl": "2b3ee7024446cdf7aae01adefb616f74f641876fbf31807b1a2f94e0d294de1d",
+    "paper/evidence/w8-compatibility/README.md": "81b6d1bdc1689eae24c0e6f9db4c5e5a624d246042cde0f752d77dc8fd1c84b7",
+    "paper/evidence/w8-compatibility/MANIFEST.sha256": "3c9c72d44f6e0878ac425a9c5e302fa3cd4648c35ed28fed25bd249a1c0fcfe5"
+  },
+  "speedV2Admission": {
+    "schemaVersion": 1,
+    "acceptedBundle": {
+      "relativePath": "paper/evidence/speed-v2/attempts/speed-v2-20260831-j",
+      "runID": "speed-v2-20260831-j",
+      "finalizationSHA256": "061d802ecc587dde3487780f3e5dca66402e8cd2ac893df5a34c108e1f04650d",
+      "publicEvidenceIndexSHA256": "dbb570d0ca1fda3c07ab90642d6df356ccb937b41213ec591ace6d875aec5f21",
+      "publicHostRecordSHA256": "aad5495585f8f9ec184aa9d2f6015cfb2082a41c5f006c9431702e43cc7f68ff",
+      "analyzerSummarySHA256": "134934dbd311ade970b532805aa8096c0311b51e872ce78d87e11057e474ddc5"
+    },
+    "reportProtocol": "paper/REPORT_PROTOCOL_V3.md",
+    "reportProtocolSHA256": "760052171c27a6e851be356ef6ed0a76d4066d1d3851d42d53488284951c5d94",
+    "hostIdentity": {
+      "protocolCommit": "14e4067a960cbac5a06b372b502355074304d0d4",
+      "benchmarkCommit": "29271b8d9ca9a2d36d6752debc0ac37416aa8c59",
+      "runtimeCommit": "85e2f2d8c6433825e64219a32693ed1a4aed519f",
+      "runtimePatchSHA256": "5f7730605866a91c92ece798f03953f88249e61eeaed8660e05c4a1022809485",
+      "patchedRuntimeSourceSHA256": "11cf90c72b4b4b6695c6fdbc63e58dc7d41633a7bba9ffa5273852cc079cf0e0"
+    },
+    "toolchain": {
+      "xcodeBuild": "27A5252f",
+      "iphoneOSSDKBuild": "24A5422a"
+    },
+    "device": {
+      "marketingName": "iPhone 15 Pro",
+      "productType": "iPhone16,1",
+      "reality": "physical",
+      "osVersion": "27.0",
+      "osBuild": "24A5424a"
+    },
+    "commonIdentity": {
+      "protocol": "public-artifact-speed-confirmation-v2",
+      "protocolCommit": "14e4067a960cbac5a06b372b502355074304d0d4",
+      "benchmarkCommit": "29271b8d9ca9a2d36d6752debc0ac37416aa8c59",
+      "runtimeCommit": "85e2f2d8c6433825e64219a32693ed1a4aed519f",
+      "runtimePatchSHA256": "5f7730605866a91c92ece798f03953f88249e61eeaed8660e05c4a1022809485",
+      "patchedRuntimeSourceSHA256": "11cf90c72b4b4b6695c6fdbc63e58dc7d41633a7bba9ffa5273852cc079cf0e0",
+      "templateControl": "enable_thinking=false;fallback=disabled",
+      "buildConfiguration": "release",
+      "xcodeBuild": "27A5252f",
+      "deviceModel": "iPhone16,1",
+      "contextLength": 4096,
+      "architecture": "h16p"
+    },
+    "profiles": {
+      "W8_ANE": {
+        "bundleIdentifier": "io.github.massif01.qwen3.w8speedbench",
+        "modelRepository": "massif/Qwen3-1.7B-CoreAI-ANE-W8-4K-h16p",
+        "modelRevision": "75bbe06906cb5d953e602e3e4fb6364187c81822",
+        "modelSourceHash": "13ba3f73fcb7e090cd6ba1ca14b6b8903516ab608d451e94b9cdd750cfceda2c",
+        "modelMainSHA256": "09f609775baa56b11ff3c91bfcb07b145930297289634fdc5514b2a5ab4dc7ca",
+        "profileDescription": "compression=W8-per-tensor kv=FP16-fixed target=ANE-AOT",
+        "artifactManifestSHA256": "91c68e82e280a36d39aaeef9b8726ab1d59e52760b6f970db67c334a674d47b2"
+      },
+      "INT4_GPU": {
+        "bundleIdentifier": "io.github.massif01.qwen3.int4speedbench",
+        "modelRepository": "massif/Qwen3-1.7B-CoreAI-GPU-INT4-4K-h16p",
+        "modelRevision": "c32b6342c98e5e23363f692e614bccca37f24234",
+        "modelSourceHash": "c0e3a7463b722ae6740de3cfdfa835b06451436567663bdd79f2c8e996794cd6",
+        "modelMainSHA256": "ad953b6bc902accc1f1200a8870012c5dec6b488f0f4ec0f10a9916b16cb56ef",
+        "profileDescription": "compression=INT4-block32 kv=FP16-growing target=GPU",
+        "artifactManifestSHA256": "18c22f4f35ae54421a58593af2858979c13b0cf6f5a15d18c044469007fa86ae"
+      }
+    }
+  },
   "dataset": {
     "id": "hfl/cmrc2018",
     "config": "default",

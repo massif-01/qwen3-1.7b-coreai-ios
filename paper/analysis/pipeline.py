@@ -8,9 +8,11 @@ import csv
 import hashlib
 import html
 import json
+import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
+import random
 import shutil
 import statistics
 import subprocess
@@ -18,10 +20,71 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
+REPOSITORY_ROOT = ROOT.parent
 ANALYSIS_DIR = ROOT / "analysis"
 LOCK_PATH = ANALYSIS_DIR / "source-lock.json"
 PUBLIC_STATUS_PATH = ANALYSIS_DIR / "public-status-v1.json"
 DEFAULT_GENERATED_DIR = ANALYSIS_DIR / "generated"
+W8_COMPATIBILITY_EVIDENCE_DIR = ROOT / "evidence" / "w8-compatibility"
+W8_COMPATIBILITY_EVENTS_PATH = (
+    W8_COMPATIBILITY_EVIDENCE_DIR / "sanitized-load-events.jsonl"
+)
+W8_COMPATIBILITY_MANIFEST_PATH = W8_COMPATIBILITY_EVIDENCE_DIR / "MANIFEST.sha256"
+SPEED_V2_ANALYSIS = "public-artifact-speed-confirmation-v2"
+SPEED_V2_PROFILES = ("W8_ANE", "INT4_GPU")
+SPEED_V2_WORKLOADS = (
+    "business_medium",
+    "near4k_prefill",
+    "decode_256_cap",
+)
+SPEED_V2_BLOCK_SCHEDULE = (
+    (1, "W8_ANE"),
+    (2, "INT4_GPU"),
+    (3, "INT4_GPU"),
+    (4, "W8_ANE"),
+    (5, "INT4_GPU"),
+    (6, "W8_ANE"),
+    (7, "W8_ANE"),
+    (8, "INT4_GPU"),
+)
+SPEED_V2_HEADLINE_METRICS = (
+    "inputTokens",
+    "outputTokens",
+    "tokenTTFTSeconds",
+    "visibleTTFTSeconds",
+    "totalSeconds",
+    "visibleDecodeTokensPerSecond",
+    "endToEndVisibleTokensPerSecond",
+)
+SPEED_V2_ALL_METRICS = (
+    "inputTokens",
+    "outputTokens",
+    "visibleTokens",
+    "firstOutputTokenCount",
+    "firstOutputReasoningTokenCount",
+    "firstVisibleTokenCount",
+    "tokenTTFTSeconds",
+    "visibleTTFTSeconds",
+    "totalSeconds",
+    "visibleDecodeTokensPerSecond",
+    "endToEndVisibleTokensPerSecond",
+    "responseCharacters",
+    "responseUTF8Bytes",
+    "memory.availableMiB",
+    "memory.residentMiB",
+    "memory.peakResidentMiB",
+)
+SPEED_V2_INTEGER_METRICS = {
+    "inputTokens",
+    "outputTokens",
+    "visibleTokens",
+    "firstOutputTokenCount",
+    "firstOutputReasoningTokenCount",
+    "firstVisibleTokenCount",
+    "responseCharacters",
+    "responseUTF8Bytes",
+}
+SPEED_V2_FLOAT_TOLERANCE = 1e-9
 
 
 class PipelineError(RuntimeError):
@@ -65,6 +128,23 @@ def run(
 
 def read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _reject_json_constant(value: str) -> None:
+    raise PipelineError(f"Non-finite JSON constant is not admissible: {value}")
+
+
+def read_json_strict(path: Path) -> dict:
+    try:
+        value = json.loads(
+            path.read_text(encoding="utf-8"),
+            parse_constant=_reject_json_constant,
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise PipelineError(f"Invalid JSON evidence file {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise PipelineError(f"JSON evidence root must be an object: {path}")
+    return value
 
 
 def write_json(path: Path, value: object) -> None:
@@ -150,6 +230,268 @@ def ensure_download(url: str, target: Path, expected_hash: str, offline: bool) -
     os.replace(temporary, target)
 
 
+def load_unique_jsonl(path: Path) -> dict[str, dict]:
+    records: dict[str, dict] = {}
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if not isinstance(record, dict) or not isinstance(record.get("id"), str):
+                raise PipelineError(f"Invalid result record at {path}:{line_number}")
+            sample_id = record["id"]
+            if sample_id in records:
+                raise PipelineError(f"Duplicate result ID in {path}: {sample_id}")
+            records[sample_id] = record
+    return records
+
+
+def validate_w8_compatibility_evidence_manifest() -> None:
+    expected_files = {"README.md", "sanitized-load-events.jsonl"}
+    actual_files = {
+        path.relative_to(W8_COMPATIBILITY_EVIDENCE_DIR).as_posix()
+        for path in W8_COMPATIBILITY_EVIDENCE_DIR.rglob("*")
+        if path.is_file() and path != W8_COMPATIBILITY_MANIFEST_PATH
+    }
+    if actual_files != expected_files:
+        raise PipelineError(
+            "W8 compatibility evidence inventory changed: "
+            f"unexpected={sorted(actual_files - expected_files)}, "
+            f"missing={sorted(expected_files - actual_files)}"
+        )
+
+    listed: dict[str, str] = {}
+    for line_number, line in enumerate(
+        W8_COMPATIBILITY_MANIFEST_PATH.read_text(encoding="utf-8").splitlines(),
+        start=1,
+    ):
+        match = re.fullmatch(r"([0-9a-f]{64})  ([^/]+)", line)
+        if match is None:
+            raise PipelineError(
+                f"Malformed W8 compatibility manifest line {line_number}"
+            )
+        expected_hash, relative = match.groups()
+        if relative in listed:
+            raise PipelineError(
+                f"Duplicate W8 compatibility manifest path: {relative}"
+            )
+        listed[relative] = expected_hash
+    if set(listed) != expected_files:
+        raise PipelineError("W8 compatibility manifest inventory changed")
+    for relative, expected_hash in listed.items():
+        require_hash(W8_COMPATIBILITY_EVIDENCE_DIR / relative, expected_hash)
+
+
+def validate_quality_inputs(
+    sample_path: Path,
+    result_specs: dict[str, tuple[Path, str]],
+) -> tuple[dict, dict[str, dict[str, dict]]]:
+    envelope = read_json(sample_path)
+    samples = envelope.get("samples")
+    if not isinstance(samples, list) or len(samples) != 300:
+        raise PipelineError("Frozen CMRC sample must contain exactly 300 rows")
+
+    sample_by_id: dict[str, dict] = {}
+    strata: dict[str, int] = {"short": 0, "medium": 0, "long": 0}
+    for sample in samples:
+        sample_id = sample.get("id")
+        if not isinstance(sample_id, str) or sample_id in sample_by_id:
+            raise PipelineError(f"Invalid or duplicate frozen sample ID: {sample_id}")
+        stratum = sample.get("stratum")
+        if stratum not in strata:
+            raise PipelineError(f"Unexpected CMRC stratum for {sample_id}: {stratum}")
+        strata[stratum] += 1
+        sample_by_id[sample_id] = sample
+    if strata != {"short": 100, "medium": 100, "long": 100}:
+        raise PipelineError(f"Frozen CMRC strata changed: {strata}")
+
+    records_by_label: dict[str, dict[str, dict]] = {}
+    expected_ids = set(sample_by_id)
+    for label, (path, expected_variant) in result_specs.items():
+        records = load_unique_jsonl(path)
+        observed_ids = set(records)
+        if observed_ids != expected_ids:
+            raise PipelineError(
+                f"Result ID set mismatch for {label}: "
+                f"missing={sorted(expected_ids - observed_ids)}, "
+                f"extra={sorted(observed_ids - expected_ids)}"
+            )
+        for sample_id, sample in sample_by_id.items():
+            record = records[sample_id]
+            if record.get("error") is not None:
+                raise PipelineError(f"Recorded generation error for {label}/{sample_id}")
+            if record.get("variant") != expected_variant:
+                raise PipelineError(
+                    f"Variant mismatch for {label}/{sample_id}: {record.get('variant')}"
+                )
+            for key in (
+                "datasetRowIndex",
+                "ordinal",
+                "stratum",
+                "contextCharacterCount",
+            ):
+                if record.get(key) != sample.get(key):
+                    raise PipelineError(
+                        f"Sample metadata mismatch for {label}/{sample_id}/{key}"
+                    )
+            if not isinstance(record.get("content"), str):
+                raise PipelineError(f"Missing generated text for {label}/{sample_id}")
+            input_tokens = record.get("inputTokens")
+            if not isinstance(input_tokens, int) or isinstance(input_tokens, bool) \
+                    or input_tokens <= 0:
+                raise PipelineError(
+                    f"Invalid input-token count for {label}/{sample_id}: {input_tokens}"
+                )
+            output_tokens = record.get("outputTokens")
+            if not isinstance(output_tokens, int) or isinstance(output_tokens, bool) \
+                    or not 0 <= output_tokens < 128:
+                raise PipelineError(
+                    f"Invalid or capped output-token count for {label}/{sample_id}: "
+                    f"{output_tokens}"
+                )
+            cached_tokens = record.get("cachedInputTokens")
+            if (
+                not isinstance(cached_tokens, int)
+                or isinstance(cached_tokens, bool)
+                or cached_tokens != 0
+            ):
+                raise PipelineError(f"Unexpected cached input for {label}/{sample_id}")
+            reasoning_tokens = record.get("reasoningTokens")
+            if (
+                not isinstance(reasoning_tokens, int)
+                or isinstance(reasoning_tokens, bool)
+                or reasoning_tokens != 0
+            ):
+                raise PipelineError(f"Unexpected reasoning output for {label}/{sample_id}")
+        records_by_label[label] = records
+
+    labels = list(records_by_label)
+    for sample_id in expected_ids:
+        input_counts = {
+            records_by_label[label][sample_id].get("inputTokens") for label in labels
+        }
+        if len(input_counts) != 1:
+            raise PipelineError(f"Input-token mismatch across profiles for {sample_id}")
+    return envelope, records_by_label
+
+
+def load_locked_scorer(path: Path) -> dict:
+    namespace = {"__name__": "locked_cmrc_scorer", "__file__": str(path)}
+    exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), namespace)
+    return namespace
+
+
+def stratified_bootstrap_interval(
+    differences_by_stratum: dict[str, list[float]],
+    *,
+    seed: int,
+) -> dict:
+    expected = {"short": 100, "medium": 100, "long": 100}
+    observed = {key: len(value) for key, value in differences_by_stratum.items()}
+    if observed != expected:
+        raise PipelineError(f"Paired bootstrap strata changed: {observed}")
+
+    generator = random.Random(seed)
+    means: list[float] = []
+    for _ in range(10_000):
+        selected: list[float] = []
+        for stratum in ("short", "medium", "long"):
+            values = differences_by_stratum[stratum]
+            selected.extend(values[generator.randrange(len(values))] for _ in values)
+        means.append(statistics.fmean(selected))
+    means.sort()
+    all_differences = [
+        value
+        for stratum in ("short", "medium", "long")
+        for value in differences_by_stratum[stratum]
+    ]
+    return {
+        "observedPoints": statistics.fmean(all_differences),
+        "lower95Points": linear_quantile(means, 0.025),
+        "upper95Points": linear_quantile(means, 0.975),
+        "resamples": len(means),
+        "seed": seed,
+        "method": "paired percentile bootstrap stratified by context-length band",
+        "quantileDefinition": "Hyndman-Fan type 7 linear interpolation",
+        "resampleUnit": "example within stratum",
+        "stratumSampleSizes": expected,
+    }
+
+
+def linear_quantile(values: list[float], probability: float) -> float:
+    if not values:
+        raise PipelineError("Cannot compute a quantile of an empty sequence")
+    if not 0.0 <= probability <= 1.0:
+        raise PipelineError(f"Invalid quantile probability: {probability}")
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    position = (len(ordered) - 1) * probability
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+
+
+def build_stratified_quality_analysis(
+    scorer_path: Path,
+    envelope: dict,
+    records_by_label: dict[str, dict[str, dict]],
+    published: dict,
+) -> dict:
+    scorer = load_locked_scorer(scorer_path)
+    samples = envelope["samples"]
+    scored = {
+        label: scorer["score_variant"](samples, records)
+        for label, records in records_by_label.items()
+    }
+    labels = list(scored)
+    if labels != ["W8_ANE", "INT4_GPU"]:
+        raise PipelineError(f"Unexpected profile order for paired analysis: {labels}")
+
+    left_by_id = {row["id"]: row for row in scored[labels[0]]["rows"]}
+    right_by_id = {row["id"]: row for row in scored[labels[1]]["rows"]}
+    f1_differences = {"short": [], "medium": [], "long": []}
+    em_differences = {"short": [], "medium": [], "long": []}
+    for sample in samples:
+        sample_id = sample["id"]
+        stratum = sample["stratum"]
+        left = left_by_id[sample_id]
+        right = right_by_id[sample_id]
+        f1_differences[stratum].append(100.0 * (left["f1"] - right["f1"]))
+        em_differences[stratum].append(100.0 * (left["em"] - right["em"]))
+
+    result = json.loads(json.dumps(published))
+    result["schemaVersion"] = 2
+    result["analysisProvenance"] = {
+        "status": "post-review reanalysis",
+        "publishedScoringReproducedByteIdentically": True,
+        "newModelOutputsCreated": False,
+        "newDeviceMeasurementsCreated": False,
+        "description": (
+            "Paired uncertainty was recomputed after manuscript review from the "
+            "unchanged published predictions and locked scorer."
+        ),
+    }
+    result["metric"] = (
+        "Documented Python 3 adaptation of the official CMRC2018 EM/F1 formula; "
+        "NLTK Treebank tokenization without sentence splitting"
+    )
+    result["comparison"]["f1DifferenceFirstMinusSecond"] = (
+        stratified_bootstrap_interval(f1_differences, seed=20260721)
+    )
+    result["comparison"]["emDifferenceFirstMinusSecond"] = (
+        stratified_bootstrap_interval(em_differences, seed=20260722)
+    )
+    result["comparison"]["signTest"] = {
+        "method": "exact two-sided paired sign test",
+        "tiesExcluded": True,
+        "f1PValue": result["comparison"]["f1WinSignTestPValue"],
+        "emPValue": result["comparison"]["emWinSignTestPValue"],
+    }
+    return result
+
+
 def rebuild_and_score_quality(
     lock: dict,
     comparison_repo: Path,
@@ -178,6 +520,20 @@ def rebuild_and_score_quality(
     if freeze_result["uniqueContexts"] != dataset["expectedUniqueContexts"]:
         raise PipelineError("CMRC context count changed during sample reconstruction")
 
+    result_specs = {
+        "W8_ANE": (
+            comparison_repo
+            / "benchmarks/results/raw/w8-ane-no-thinking-results.jsonl",
+            "W8_ANE",
+        ),
+        "INT4_GPU": (
+            comparison_repo
+            / "benchmarks/results/raw/int4-gpu-no-thinking-results.jsonl",
+            "INT4_GPU",
+        ),
+    }
+    envelope, records_by_label = validate_quality_inputs(sample_path, result_specs)
+
     score_output = bytes(
         run(
             [
@@ -202,8 +558,18 @@ def rebuild_and_score_quality(
             "Recomputed quality JSON is not byte-identical to the published result"
         )
 
+    published = read_json(recomputed_path)
+    analysis = build_stratified_quality_analysis(
+        comparison_repo / "benchmarks/tools/score_frozen_cmrc_py3.py",
+        envelope,
+        records_by_label,
+        published,
+    )
+    analysis_path = generated_dir / "quality-analysis-v2.json"
+    write_json(analysis_path, analysis)
+
     verification = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "dataset": {
             "officialSourceSHA256": dataset["officialSourceSHA256"],
             "canonicalRowsSHA256": dataset["canonicalRowsSHA256"],
@@ -215,12 +581,26 @@ def rebuild_and_score_quality(
         "runtime": lock["runtime"],
         "publishedQualitySHA256": sha256(published_path),
         "recomputedQualitySHA256": sha256(recomputed_path),
+        "paperAnalysisSHA256": sha256(analysis_path),
         "byteIdenticalToPublished": True,
+        "paperAnalysisStatus": "post-review reanalysis",
+        "qualityInputValidation": {
+            "sampleIDsUnique": True,
+            "resultIDsUnique": True,
+            "resultIDSetsExact": True,
+            "recordedErrors": 0,
+            "maximumResponseTokenHits": 0,
+            "inputTokenCountsPositive": True,
+            "pairedInputTokenCountsEqual": True,
+            "reportedCachedInputTokensNonzero": 0,
+            "reasoningTokenCountsNonzero": 0,
+            "stratumSampleSizes": {"short": 100, "medium": 100, "long": 100},
+        },
         "newModelOutputsCreated": False,
         "newDeviceMeasurementsCreated": False,
     }
     write_json(generated_dir / "quality-verification.json", verification)
-    return read_json(recomputed_path)
+    return analysis
 
 
 def markdown_table(document: str, heading: str) -> list[list[str]]:
@@ -424,6 +804,803 @@ def extract_speed(comparison_repo: Path, generated_dir: Path) -> dict:
     return output
 
 
+def _require_evidence(condition: bool, message: str) -> None:
+    if not condition:
+        raise PipelineError(f"Speed-v2 evidence rejected: {message}")
+
+
+def _finite_evidence_number(value: object, field: str) -> float:
+    _require_evidence(
+        isinstance(value, (int, float)) and not isinstance(value, bool),
+        f"{field} must be numeric",
+    )
+    number = float(value)
+    _require_evidence(math.isfinite(number), f"{field} must be finite")
+    return number
+
+
+def _safe_public_evidence_path(bundle_root: Path, relative: str) -> Path:
+    relative_path = PurePosixPath(relative)
+    _require_evidence(
+        bool(relative)
+        and not relative_path.is_absolute()
+        and relative_path.parts[0] == "public"
+        and ".." not in relative_path.parts,
+        f"invalid public evidence path {relative!r}",
+    )
+    path = bundle_root
+    for part in relative_path.parts:
+        path /= part
+        _require_evidence(not path.is_symlink(), f"symlink is not admissible: {relative}")
+    _require_evidence(path.is_file(), f"indexed public file is missing: {relative}")
+    return path
+
+
+def _validate_public_speed_bundle_inventory(
+    bundle_root: Path,
+) -> tuple[dict, dict[str, dict]]:
+    _require_evidence(bundle_root.is_dir(), "publication bundle directory is missing")
+    top_level = {path.name for path in bundle_root.iterdir()}
+    _require_evidence(
+        top_level == {"FINALIZED.json", "public"},
+        "bundle root must contain only FINALIZED.json and public/",
+    )
+    for path in bundle_root.rglob("*"):
+        _require_evidence(not path.is_symlink(), f"symlink is not admissible: {path}")
+        if path.is_file():
+            relative = path.relative_to(bundle_root).as_posix()
+            _require_evidence(
+                relative == "FINALIZED.json" or relative.startswith("public/"),
+                f"private or unclassified file is not admissible: {relative}",
+            )
+
+    index_path = bundle_root / "public/evidence-index.json"
+    public_index = read_json_strict(index_path)
+    _require_evidence(public_index.get("schemaVersion") == 1, "public index schema")
+    expected_exclusions = {
+        "host/evidence-index-private.json",
+        "public/evidence-index.json",
+        "FINALIZED.json",
+    }
+    _require_evidence(
+        set(public_index.get("selfExclusion", [])) == expected_exclusions,
+        "public index exclusions changed",
+    )
+    entries = public_index.get("publicFiles")
+    _require_evidence(isinstance(entries, list), "public index file list is missing")
+    indexed: dict[str, dict] = {}
+    for entry in entries:
+        _require_evidence(isinstance(entry, dict), "public index entry is not an object")
+        relative = entry.get("path")
+        _require_evidence(isinstance(relative, str), "public index path is invalid")
+        _require_evidence(relative not in indexed, f"duplicate public index path {relative}")
+        _require_evidence(entry.get("visibility") == "public", f"visibility mismatch: {relative}")
+        byte_count = entry.get("bytes")
+        expected_hash = entry.get("sha256")
+        _require_evidence(
+            isinstance(byte_count, int)
+            and not isinstance(byte_count, bool)
+            and byte_count >= 0,
+            f"invalid byte count: {relative}",
+        )
+        _require_evidence(
+            isinstance(expected_hash, str)
+            and re.fullmatch(r"[0-9a-f]{64}", expected_hash) is not None,
+            f"invalid SHA-256: {relative}",
+        )
+        path = _safe_public_evidence_path(bundle_root, relative)
+        _require_evidence(path.stat().st_size == byte_count, f"byte count changed: {relative}")
+        _require_evidence(sha256(path) == expected_hash, f"SHA-256 changed: {relative}")
+        try:
+            public_text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as error:
+            raise PipelineError(
+                f"Speed-v2 evidence rejected: public file is not UTF-8 text: {relative}"
+            ) from error
+        _require_evidence(
+            re.search(r"/Users/|/(?:private/)?var/folders/", public_text) is None,
+            f"private local path appears in public evidence: {relative}",
+        )
+        indexed[relative] = dict(entry)
+
+    actual = {
+        path.relative_to(bundle_root).as_posix()
+        for path in (bundle_root / "public").rglob("*")
+        if path.is_file() and path != index_path
+    }
+    _require_evidence(
+        set(indexed) == actual,
+        "public index does not cover exactly every public evidence file",
+    )
+    return public_index, indexed
+
+
+def _require_index_binding(
+    indexed: dict[str, dict],
+    relative: str,
+    path: Path,
+) -> dict:
+    _require_evidence(relative in indexed, f"required public file is not indexed: {relative}")
+    entry = indexed[relative]
+    _require_evidence(entry["bytes"] == path.stat().st_size, f"binding size mismatch: {relative}")
+    _require_evidence(entry["sha256"] == sha256(path), f"binding hash mismatch: {relative}")
+    return entry
+
+
+def _validate_speed_v2_metric(
+    metric: object,
+    field: str,
+    count: int,
+    *,
+    require_sample_ids: bool,
+    expected_physical_blocks: set[int] | None = None,
+    expected_block_ids: dict[int, str] | None = None,
+) -> dict[str | int, dict]:
+    _require_evidence(isinstance(metric, dict), f"{field} summary is missing")
+    _require_evidence(metric.get("count") == count, f"{field} count must be {count}")
+    values = metric.get("values")
+    _require_evidence(isinstance(values, list) and len(values) == count, f"{field} values incomplete")
+    observations: dict[str | int, dict] = {}
+    block_counts: dict[int, int] = {}
+    numeric_values: list[float] = []
+    for ordinal, observation in enumerate(values, start=1):
+        _require_evidence(isinstance(observation, dict), f"{field} observation {ordinal} is invalid")
+        number = _finite_evidence_number(
+            observation.get("value"),
+            f"{field} observation {ordinal}",
+        )
+        numeric_values.append(number)
+        physical_block = observation.get("physicalBlock")
+        if expected_physical_blocks is not None:
+            _require_evidence(
+                isinstance(physical_block, int)
+                and not isinstance(physical_block, bool)
+                and physical_block in expected_physical_blocks,
+                f"{field} observation {ordinal} has an invalid physical block",
+            )
+            block_counts[physical_block] = block_counts.get(physical_block, 0) + 1
+        if require_sample_ids:
+            sample_id = observation.get("sampleID")
+            _require_evidence(
+                isinstance(sample_id, str)
+                and bool(sample_id)
+                and sample_id not in observations,
+                f"{field} sample IDs must be unique",
+            )
+            observations[sample_id] = {
+                "value": number,
+                "rawValue": observation.get("value"),
+                "physicalBlock": physical_block,
+            }
+        else:
+            _require_evidence(
+                isinstance(physical_block, int)
+                and not isinstance(physical_block, bool)
+                and physical_block not in observations,
+                f"{field} physical blocks must be unique",
+            )
+            if expected_block_ids is not None:
+                _require_evidence(
+                    observation.get("blockID") == expected_block_ids[physical_block],
+                    f"{field} block ID does not match physical block {physical_block}",
+                )
+            observations[physical_block] = {
+                "value": number,
+                "rawValue": observation.get("value"),
+                "physicalBlock": physical_block,
+                "blockID": observation.get("blockID"),
+            }
+    if expected_physical_blocks is not None:
+        _require_evidence(
+            set(block_counts) == expected_physical_blocks,
+            f"{field} physical-block set changed",
+        )
+        expected_per_block = count // len(expected_physical_blocks)
+        _require_evidence(
+            count % len(expected_physical_blocks) == 0
+            and all(
+                block_counts[physical_block] == expected_per_block
+                for physical_block in expected_physical_blocks
+            ),
+            f"{field} observations are not balanced across physical blocks",
+        )
+    recomputed = {
+        "median": statistics.median(numeric_values),
+        "q1": linear_quantile(numeric_values, 0.25),
+        "q3": linear_quantile(numeric_values, 0.75),
+        "min": min(numeric_values),
+        "max": max(numeric_values),
+    }
+    for statistic, expected_value in recomputed.items():
+        observed = _finite_evidence_number(metric.get(statistic), f"{field} {statistic}")
+        _require_evidence(
+            observed == expected_value,
+            f"{field} {statistic} does not match its observations",
+        )
+    return observations
+
+
+def _require_speed_v2_close(observed: float, expected: float, field: str) -> None:
+    _require_evidence(
+        math.isclose(
+            observed,
+            expected,
+            rel_tol=SPEED_V2_FLOAT_TOLERANCE,
+            abs_tol=SPEED_V2_FLOAT_TOLERANCE,
+        ),
+        f"{field} is inconsistent with its defining values",
+    )
+
+
+def _validate_speed_v2_sample_definitions(
+    metrics: dict[str, dict[str | int, dict]],
+    field: str,
+) -> None:
+    sample_ids = set(metrics["inputTokens"])
+    for sample_id in sample_ids:
+        values = {
+            metric_name: metrics[metric_name][sample_id]
+            for metric_name in SPEED_V2_ALL_METRICS
+        }
+        for metric_name in SPEED_V2_INTEGER_METRICS:
+            numeric_value = values[metric_name]["value"]
+            _require_evidence(
+                numeric_value.is_integer(),
+                f"{field}/{sample_id}/{metric_name} must be integer-valued",
+            )
+
+        input_tokens = int(values["inputTokens"]["value"])
+        output_tokens = int(values["outputTokens"]["value"])
+        visible_tokens = int(values["visibleTokens"]["value"])
+        first_output = int(values["firstOutputTokenCount"]["value"])
+        first_output_reasoning = int(
+            values["firstOutputReasoningTokenCount"]["value"]
+        )
+        first_visible = int(values["firstVisibleTokenCount"]["value"])
+        _require_evidence(input_tokens > 0, f"{field}/{sample_id} input tokens must be positive")
+        _require_evidence(output_tokens > 0, f"{field}/{sample_id} output tokens must be positive")
+        _require_evidence(
+            visible_tokens == output_tokens,
+            f"{field}/{sample_id} visible tokens must equal output tokens",
+        )
+        _require_evidence(
+            first_output_reasoning == 0,
+            f"{field}/{sample_id} first-output reasoning tokens must be zero",
+        )
+        _require_evidence(
+            first_visible == first_output - first_output_reasoning
+            and 0 < first_visible <= visible_tokens,
+            f"{field}/{sample_id} first-visible token accounting is invalid",
+        )
+
+        token_ttft = values["tokenTTFTSeconds"]["value"]
+        visible_ttft = values["visibleTTFTSeconds"]["value"]
+        total = values["totalSeconds"]["value"]
+        _require_evidence(
+            0.0 <= token_ttft <= visible_ttft <= total and total > 0.0,
+            f"{field}/{sample_id} timing order is invalid",
+        )
+        decoded_tokens = visible_tokens - first_visible
+        decode_seconds = total - visible_ttft
+        _require_evidence(
+            decoded_tokens > 0 and decode_seconds > 0.0,
+            f"{field}/{sample_id} visible decode interval must be positive",
+        )
+        _require_speed_v2_close(
+            values["visibleDecodeTokensPerSecond"]["value"],
+            decoded_tokens / decode_seconds,
+            f"{field}/{sample_id}/visibleDecodeTokensPerSecond",
+        )
+        _require_speed_v2_close(
+            values["endToEndVisibleTokensPerSecond"]["value"],
+            visible_tokens / total,
+            f"{field}/{sample_id}/endToEndVisibleTokensPerSecond",
+        )
+        _require_evidence(
+            values["responseCharacters"]["value"] >= 0
+            and values["responseUTF8Bytes"]["value"]
+            >= values["responseCharacters"]["value"],
+            f"{field}/{sample_id} response-size accounting is invalid",
+        )
+        available = values["memory.availableMiB"]["value"]
+        resident = values["memory.residentMiB"]["value"]
+        peak = values["memory.peakResidentMiB"]["value"]
+        _require_evidence(
+            available >= 0.0 and resident >= 0.0 and peak >= resident,
+            f"{field}/{sample_id} memory observation is invalid",
+        )
+
+
+def _validate_speed_v2_paired_metric(
+    metric: object,
+    field: str,
+    a_observations: dict[str | int, dict],
+    b_observations: dict[str | int, dict],
+) -> None:
+    _require_evidence(isinstance(metric, dict), f"{field} paired summary is missing")
+    _require_evidence(metric.get("count") == 20, f"{field} paired count must be 20")
+    values = metric.get("values")
+    _require_evidence(
+        isinstance(values, list) and len(values) == 20,
+        f"{field} paired observations are incomplete",
+    )
+    expected_sample_ids = set(a_observations)
+    _require_evidence(
+        expected_sample_ids == set(b_observations),
+        f"{field} profile sample-ID sets differ",
+    )
+    observed_sample_ids: set[str] = set()
+    differences: list[float] = []
+    for ordinal, observation in enumerate(values, start=1):
+        _require_evidence(
+            isinstance(observation, dict),
+            f"{field} paired observation {ordinal} is invalid",
+        )
+        sample_id = observation.get("sampleID")
+        _require_evidence(
+            isinstance(sample_id, str)
+            and sample_id in expected_sample_ids
+            and sample_id not in observed_sample_ids,
+            f"{field} paired sample IDs must exactly match the profile samples",
+        )
+        observed_sample_ids.add(sample_id)
+        a_value = _finite_evidence_number(observation.get("a"), f"{field}/{sample_id}/a")
+        b_value = _finite_evidence_number(observation.get("b"), f"{field}/{sample_id}/b")
+        difference = _finite_evidence_number(
+            observation.get("aMinusB"),
+            f"{field}/{sample_id}/aMinusB",
+        )
+        _require_speed_v2_close(
+            a_value,
+            a_observations[sample_id]["value"],
+            f"{field}/{sample_id}/a",
+        )
+        _require_speed_v2_close(
+            b_value,
+            b_observations[sample_id]["value"],
+            f"{field}/{sample_id}/b",
+        )
+        _require_speed_v2_close(
+            difference,
+            a_value - b_value,
+            f"{field}/{sample_id}/aMinusB",
+        )
+        differences.append(difference)
+    _require_evidence(
+        observed_sample_ids == expected_sample_ids,
+        f"{field} paired sample-ID set is incomplete",
+    )
+    recomputed = {
+        "median": statistics.median(differences),
+        "q1": linear_quantile(differences, 0.25),
+        "q3": linear_quantile(differences, 0.75),
+        "min": min(differences),
+        "max": max(differences),
+    }
+    for statistic, expected_value in recomputed.items():
+        observed = _finite_evidence_number(metric.get(statistic), f"{field} {statistic}")
+        _require_speed_v2_close(observed, expected_value, f"{field} {statistic}")
+
+
+def _validate_speed_v2_summary(summary: dict, expected: dict) -> dict[str, dict[str, float]]:
+    _require_evidence(summary.get("schemaVersion") == 2, "analyzer schema must be 2")
+    _require_evidence(summary.get("analysis") == SPEED_V2_ANALYSIS, "analysis name mismatch")
+    _require_evidence(
+        summary.get("conformance")
+        == {
+            "status": "passed",
+            "physicalBlocks": 8,
+            "plannedSamples": 120,
+            "pairedLogicalSamples": 60,
+        },
+        "analyzer conformance summary is not a complete passed run",
+    )
+    identities = summary.get("identities")
+    _require_evidence(isinstance(identities, dict), "analyzer identities are missing")
+    common = identities.get("common")
+    _require_evidence(isinstance(common, dict), "common identity is missing")
+    for key, value in expected["commonIdentity"].items():
+        _require_evidence(common.get(key) == value, f"common identity mismatch: {key}")
+    _require_evidence(
+        isinstance(common.get("operatingSystem"), str) and common["operatingSystem"],
+        "operating-system identity is missing",
+    )
+
+    profile_identities = identities.get("profiles")
+    _require_evidence(isinstance(profile_identities, dict), "profile identities are missing")
+    for profile in SPEED_V2_PROFILES:
+        identity = profile_identities.get(profile)
+        _require_evidence(isinstance(identity, dict), f"{profile} identity is missing")
+        for key, value in expected["profiles"][profile].items():
+            _require_evidence(identity.get(key) == value, f"{profile} identity mismatch: {key}")
+
+    profiles = summary.get("profiles")
+    _require_evidence(
+        isinstance(profiles, dict) and set(profiles) == set(SPEED_V2_PROFILES),
+        "profile result set changed",
+    )
+    storage: dict[str, dict[str, float]] = {}
+    sample_metrics: dict[str, dict[str, dict[str, dict[str | int, dict]]]] = {}
+    expected_blocks = {
+        profile: {block for block, owner in SPEED_V2_BLOCK_SCHEDULE if owner == profile}
+        for profile in SPEED_V2_PROFILES
+    }
+    for profile in SPEED_V2_PROFILES:
+        profile_result = profiles[profile]
+        _require_evidence(isinstance(profile_result, dict), f"{profile} result is invalid")
+        blocks = profile_result.get("blocks")
+        _require_evidence(isinstance(blocks, list) and len(blocks) == 4, f"{profile} must have four blocks")
+        _require_evidence(
+            all(isinstance(block, dict) for block in blocks),
+            f"{profile} block records are invalid",
+        )
+        physical_blocks = {block.get("physicalBlock") for block in blocks}
+        _require_evidence(physical_blocks == expected_blocks[profile], f"{profile} block schedule changed")
+        block_ids: dict[int, str] = {}
+        disk_bytes: list[int] = []
+        for block in blocks:
+            physical_block = block.get("physicalBlock")
+            block_id = block.get("blockID")
+            estimated_disk_bytes = block.get("estimatedDiskBytes")
+            _require_evidence(
+                isinstance(physical_block, int)
+                and not isinstance(physical_block, bool)
+                and isinstance(block_id, str)
+                and bool(block_id),
+                f"{profile} block identity is invalid",
+            )
+            _require_evidence(
+                isinstance(estimated_disk_bytes, int)
+                and not isinstance(estimated_disk_bytes, bool),
+                f"{profile} estimatedDiskBytes must be an integer",
+            )
+            block_ids[physical_block] = block_id
+            disk_bytes.append(estimated_disk_bytes)
+        _require_evidence(all(value > 0 for value in disk_bytes), f"{profile} disk bytes must be positive")
+        _require_evidence(len(set(disk_bytes)) == 1, f"{profile} disk bytes changed between blocks")
+
+        workload_results = profile_result.get("workloads")
+        _require_evidence(
+            isinstance(workload_results, dict)
+            and set(workload_results) == set(SPEED_V2_WORKLOADS),
+            f"{profile} workload set changed",
+        )
+        sample_metrics[profile] = {}
+        for workload in SPEED_V2_WORKLOADS:
+            cell = workload_results[workload]
+            _require_evidence(isinstance(cell, dict), f"{profile}/{workload} cell is invalid")
+            _require_evidence(cell.get("planned") == 20, f"{profile}/{workload} planned count")
+            _require_evidence(cell.get("completed") == 20, f"{profile}/{workload} completion count")
+            _require_evidence(cell.get("failed") == 0, f"{profile}/{workload} contains failures")
+            _require_evidence(cell.get("completionRate") == 1.0, f"{profile}/{workload} completion rate")
+            metrics = cell.get("metrics")
+            _require_evidence(
+                isinstance(metrics, dict)
+                and set(metrics) == set(SPEED_V2_ALL_METRICS),
+                f"{profile}/{workload} metric set changed",
+            )
+            metric_observations: dict[str, dict[str | int, dict]] = {}
+            expected_sample_ids: set[str | int] | None = None
+            expected_sample_blocks: dict[str | int, int] | None = None
+            for metric_name in SPEED_V2_ALL_METRICS:
+                observations = _validate_speed_v2_metric(
+                    metrics.get(metric_name),
+                    f"{profile}/{workload}/{metric_name}",
+                    20,
+                    require_sample_ids=True,
+                    expected_physical_blocks=expected_blocks[profile],
+                )
+                metric_observations[metric_name] = observations
+                sample_ids = set(observations)
+                sample_blocks = {
+                    sample_id: observation["physicalBlock"]
+                    for sample_id, observation in observations.items()
+                }
+                if expected_sample_ids is None:
+                    expected_sample_ids = sample_ids
+                    expected_sample_blocks = sample_blocks
+                else:
+                    _require_evidence(
+                        sample_ids == expected_sample_ids,
+                        f"{profile}/{workload} metric sample IDs differ",
+                    )
+                    _require_evidence(
+                        sample_blocks == expected_sample_blocks,
+                        f"{profile}/{workload} metric physical-block bindings differ",
+                    )
+            _validate_speed_v2_sample_definitions(
+                metric_observations,
+                f"{profile}/{workload}",
+            )
+            sample_metrics[profile][workload] = metric_observations
+
+        block_metrics = profile_result.get("blockMetrics")
+        _require_evidence(isinstance(block_metrics, dict), f"{profile} block metrics missing")
+        peak_metric = block_metrics.get("memory.afterUnload.peakResidentMiB")
+        _validate_speed_v2_metric(
+            peak_metric,
+            f"{profile}/memory.afterUnload.peakResidentMiB",
+            4,
+            require_sample_ids=False,
+            expected_physical_blocks=expected_blocks[profile],
+            expected_block_ids=block_ids,
+        )
+        storage[profile] = {
+            "compiledModelBundleMiB": statistics.median(disk_bytes) / (1024 * 1024),
+            "peakProcessResidentMiB": _finite_evidence_number(
+                peak_metric.get("max"),
+                f"{profile} peak process resident MiB",
+            ),
+        }
+
+    paired = summary.get("pairedAMinusB")
+    _require_evidence(isinstance(paired, dict), "paired result is missing")
+    _require_evidence(
+        paired.get("a") == "W8_ANE" and paired.get("b") == "INT4_GPU",
+        "paired profile order changed",
+    )
+    paired_workloads = paired.get("workloads")
+    _require_evidence(
+        isinstance(paired_workloads, dict)
+        and set(paired_workloads) == set(SPEED_V2_WORKLOADS),
+        "paired workload set changed",
+    )
+    for workload in SPEED_V2_WORKLOADS:
+        a_metrics = sample_metrics["W8_ANE"][workload]
+        b_metrics = sample_metrics["INT4_GPU"][workload]
+        for metric_name in SPEED_V2_ALL_METRICS:
+            _require_evidence(
+                set(a_metrics[metric_name]) == set(b_metrics[metric_name]),
+                f"{workload}/{metric_name} profile sample-ID sets differ",
+            )
+        for sample_id in a_metrics["inputTokens"]:
+            _require_evidence(
+                a_metrics["inputTokens"][sample_id]["rawValue"]
+                == b_metrics["inputTokens"][sample_id]["rawValue"],
+                f"{workload}/{sample_id} paired input-token counts differ",
+            )
+        paired_cell = paired_workloads[workload]
+        _require_evidence(isinstance(paired_cell, dict), f"paired/{workload} is invalid")
+        _require_evidence(paired_cell.get("plannedPairs") == 20, f"paired/{workload} planned count")
+        _require_evidence(paired_cell.get("successfulPairs") == 20, f"paired/{workload} success count")
+        _require_evidence(
+            paired_cell.get("unpairedFailures")
+            == {"aFailedOnly": 0, "bFailedOnly": 0, "bothFailed": 0},
+            f"paired/{workload} contains an unpaired failure",
+        )
+        paired_metrics = paired_cell.get("metrics")
+        _require_evidence(
+            isinstance(paired_metrics, dict)
+            and set(paired_metrics) == set(SPEED_V2_ALL_METRICS),
+            f"paired/{workload} metric set changed",
+        )
+        for metric_name in SPEED_V2_ALL_METRICS:
+            _validate_speed_v2_paired_metric(
+                paired_metrics[metric_name],
+                f"paired/{workload}/{metric_name}",
+                a_metrics[metric_name],
+                b_metrics[metric_name],
+            )
+    return storage
+
+
+def _accepted_speed_v2_spec(expected: dict) -> dict | None:
+    accepted = expected.get("acceptedBundle")
+    if accepted is None:
+        return None
+    required_keys = {
+        "relativePath",
+        "runID",
+        "finalizationSHA256",
+        "publicEvidenceIndexSHA256",
+        "publicHostRecordSHA256",
+        "analyzerSummarySHA256",
+    }
+    _require_evidence(
+        isinstance(accepted, dict) and set(accepted) == required_keys,
+        "accepted-bundle source-lock record is malformed",
+    )
+    relative = accepted.get("relativePath")
+    relative_path = PurePosixPath(relative) if isinstance(relative, str) else None
+    _require_evidence(
+        relative_path is not None
+        and bool(relative)
+        and not relative_path.is_absolute()
+        and ".." not in relative_path.parts,
+        "accepted-bundle relative path is invalid",
+    )
+    _require_evidence(
+        isinstance(accepted.get("runID"), str) and bool(accepted["runID"]),
+        "accepted-bundle run ID is invalid",
+    )
+    for key in (
+        "finalizationSHA256",
+        "publicEvidenceIndexSHA256",
+        "publicHostRecordSHA256",
+        "analyzerSummarySHA256",
+    ):
+        _require_evidence(
+            isinstance(accepted.get(key), str)
+            and re.fullmatch(r"[0-9a-f]{64}", accepted[key]) is not None,
+            f"accepted-bundle {key} is invalid",
+        )
+    return accepted
+
+
+def _accepted_speed_v2_path(accepted: dict) -> Path:
+    path = (REPOSITORY_ROOT / accepted["relativePath"]).resolve()
+    _require_evidence(
+        path.is_relative_to(REPOSITORY_ROOT.resolve()),
+        "accepted-bundle path leaves the repository",
+    )
+    return path
+
+
+def extract_speed_v2(
+    bundle_root: Path,
+    generated_dir: Path,
+    expected: dict,
+) -> dict:
+    protocol_relative = expected.get("reportProtocol")
+    _require_evidence(
+        isinstance(protocol_relative, str),
+        "report-side protocol path is missing from the source lock",
+    )
+    protocol_path = REPOSITORY_ROOT / protocol_relative
+    require_hash(protocol_path, expected.get("reportProtocolSHA256", ""))
+    public_index, indexed = _validate_public_speed_bundle_inventory(bundle_root)
+    accepted = _accepted_speed_v2_spec(expected)
+    if accepted is not None:
+        _require_evidence(
+            bundle_root.resolve() == _accepted_speed_v2_path(accepted),
+            "input bundle is not the source-locked accepted bundle",
+        )
+    finalization_path = bundle_root / "FINALIZED.json"
+    finalization = read_json_strict(finalization_path)
+    _require_evidence(finalization.get("schemaVersion") == 1, "finalization schema")
+    _require_evidence(finalization.get("status") == "passed", "finalization status is not passed")
+    run_id = finalization.get("runID")
+    _require_evidence(isinstance(run_id, str) and run_id, "finalization run ID is missing")
+    if accepted is not None:
+        _require_evidence(run_id == accepted["runID"], "accepted-bundle run ID mismatch")
+        _require_evidence(
+            sha256(finalization_path) == accepted["finalizationSHA256"],
+            "accepted-bundle finalization SHA-256 mismatch",
+        )
+    _require_evidence(public_index.get("runID") == run_id, "public index run ID mismatch")
+    public_index_binding = finalization.get("publicEvidenceIndex")
+    _require_evidence(
+        public_index_binding
+        == {
+            "path": "public/evidence-index.json",
+            "sha256": sha256(bundle_root / "public/evidence-index.json"),
+        },
+        "finalization does not bind the exact public index",
+    )
+
+    host_relative = "public/host/host-run-record.json"
+    host_path = _safe_public_evidence_path(bundle_root, host_relative)
+    host_entry = _require_index_binding(indexed, host_relative, host_path)
+    _require_evidence(
+        finalization.get("publicHostRecord")
+        == {key: host_entry[key] for key in ("path", "bytes", "sha256")},
+        "finalization does not bind the exact public host record",
+    )
+    host = read_json_strict(host_path)
+    _require_evidence(host.get("schemaVersion") == 4, "public host schema must be 4")
+    _require_evidence(host.get("experiment") == SPEED_V2_ANALYSIS, "host experiment mismatch")
+    _require_evidence(host.get("runID") == run_id, "host run ID mismatch")
+    _require_evidence(host.get("status") == "pending-finalization", "unexpected host status")
+    _require_evidence(host.get("preFinalizationOutcome") == "eligible", "host run is not eligible")
+    _require_evidence(host.get("conformanceErrors") == [], "host conformance errors are present")
+    for key, value in expected["hostIdentity"].items():
+        _require_evidence(host.get(key) == value, f"host identity mismatch: {key}")
+    toolchain = host.get("toolchain")
+    device = host.get("device")
+    _require_evidence(isinstance(toolchain, dict), "public toolchain identity is missing")
+    _require_evidence(isinstance(device, dict), "public device identity is missing")
+    for key, value in expected["toolchain"].items():
+        _require_evidence(toolchain.get(key) == value, f"toolchain identity mismatch: {key}")
+    for key, value in expected["device"].items():
+        _require_evidence(device.get(key) == value, f"device identity mismatch: {key}")
+    blocks = host.get("blocks")
+    _require_evidence(isinstance(blocks, list) and len(blocks) == 8, "host must contain eight blocks")
+    observed_schedule = [
+        (block.get("physicalBlock"), block.get("profile"))
+        for block in blocks
+        if isinstance(block, dict)
+    ]
+    _require_evidence(observed_schedule == list(SPEED_V2_BLOCK_SCHEDULE), "host block schedule changed")
+
+    summary_relative = "public/results/speed-v2-summary.json"
+    summary_path = _safe_public_evidence_path(bundle_root, summary_relative)
+    summary_entry = _require_index_binding(indexed, summary_relative, summary_path)
+    summary = read_json_strict(summary_path)
+    _require_evidence(summary.get("runID") == run_id, "analyzer run ID mismatch")
+    host_analysis = host.get("analysis")
+    _require_evidence(isinstance(host_analysis, dict), "host analyzer record is missing")
+    _require_evidence(host_analysis.get("status") == "passed", "host analyzer did not pass")
+    _require_evidence(host_analysis.get("exitStatus") == 0, "host analyzer exit status changed")
+    _require_evidence(
+        host_analysis.get("summaryPresent") is True,
+        "host analyzer summary was not present",
+    )
+    _require_evidence(
+        host_analysis.get("summary") == "speed-v2-summary.json",
+        "host analyzer summary path changed",
+    )
+    _require_evidence(
+        host_analysis.get("summarySHA256") == summary_entry["sha256"],
+        "host analyzer summary hash differs from public evidence",
+    )
+    storage = _validate_speed_v2_summary(summary, expected)
+    if accepted is not None:
+        _require_evidence(
+            sha256(bundle_root / "public/evidence-index.json")
+            == accepted["publicEvidenceIndexSHA256"],
+            "accepted-bundle public-index SHA-256 mismatch",
+        )
+        _require_evidence(
+            host_entry["sha256"] == accepted["publicHostRecordSHA256"],
+            "accepted-bundle host-record SHA-256 mismatch",
+        )
+        _require_evidence(
+            summary_entry["sha256"] == accepted["analyzerSummarySHA256"],
+            "accepted-bundle analyzer-summary SHA-256 mismatch",
+        )
+
+    normalized_workloads = {
+        workload: {
+            "profiles": {
+                profile: summary["profiles"][profile]["workloads"][workload]
+                for profile in SPEED_V2_PROFILES
+            },
+            "pairedAMinusB": summary["pairedAMinusB"]["workloads"][workload],
+        }
+        for workload in SPEED_V2_WORKLOADS
+    }
+    output = {
+        "schemaVersion": 2,
+        "analysis": SPEED_V2_ANALYSIS,
+        "runID": run_id,
+        "source": {
+            "reportProtocol": protocol_relative,
+            "reportProtocolSHA256": sha256(protocol_path),
+            "finalizationSHA256": sha256(finalization_path),
+            "publicEvidenceIndexSHA256": sha256(bundle_root / "public/evidence-index.json"),
+            "publicHostRecordSHA256": host_entry["sha256"],
+            "analyzerSummarySHA256": summary_entry["sha256"],
+        },
+        "admission": {
+            "finalizationStatus": "passed",
+            "preFinalizationOutcome": "eligible",
+            "conformanceStatus": "passed",
+            "physicalBlocks": 8,
+            "plannedSamples": 120,
+            "pairedLogicalSamples": 60,
+            "privateEvidenceRead": False,
+        },
+        "identities": summary["identities"],
+        "profiles": summary["profiles"],
+        "pairedAMinusB": summary["pairedAMinusB"],
+        "workloads": normalized_workloads,
+        "storageAndMemory": {
+            "compiledModelBundleMiB": {
+                profile: storage[profile]["compiledModelBundleMiB"]
+                for profile in SPEED_V2_PROFILES
+            },
+            "peakProcessResidentMiB": {
+                profile: storage[profile]["peakProcessResidentMiB"]
+                for profile in SPEED_V2_PROFILES
+            },
+        },
+        "pipelinePerformedDeviceMeasurement": False,
+        "admittedProspectiveDeviceMeasurement": True,
+    }
+    write_json(generated_dir / "speed-normalized.json", output)
+    return output
+
+
 def write_csv(path: Path, header: list[str], rows: list[list[object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as handle:
@@ -456,12 +1633,278 @@ def generate_tables(
     write_json(tables_dir / "t1-public-status.json", t1)
 
     w8_artifact = read_json(w8_repo / "results/artifact-summary.json")
-    w8_quality = read_json(w8_repo / "results/quality-summary.json")
+    historical_w8_quality = read_json(w8_repo / "results/quality-summary.json")
+    w8_fidelity = read_json(REPOSITORY_ROOT / "results/fidelity-v2-summary.json")
+    w8_compatibility = read_json(
+        REPOSITORY_ROOT / "results/w8-aot-compatibility-evidence.json"
+    )
+    w8_compatibility_events = load_unique_jsonl(W8_COMPATIBILITY_EVENTS_PATH)
+    validate_w8_compatibility_evidence_manifest()
     w8_device = read_json(w8_repo / "results/device-runtime-summary.json")
     int4_artifact = read_json(
         comparison_repo / "benchmarks/results/artifact-summary.json"
     )
     public_w8 = read_json(public_w8_validation)
+
+    if w8_compatibility.get("schemaVersion") != 1:
+        raise PipelineError("Unsupported W8 compatibility evidence schema")
+    expected_event_ids = {
+        "public-w8-old-producer-load-1",
+        "full-reboot-request-and-reconnect-before-public-w8-load-2",
+        "public-w8-old-producer-load-2-after-reboot",
+        "current-producer-w8-fresh-aot-load-1",
+    }
+    if set(w8_compatibility_events) != expected_event_ids:
+        raise PipelineError("Sanitized W8 compatibility event set changed")
+    public_events = w8_compatibility["sanitization"]["publicEventEvidence"]
+    if (
+        w8_compatibility["sanitization"]["sanitizedEventEvidenceIncluded"]
+        is not True
+        or w8_compatibility["sanitization"][
+            "unsanitizedOriginalCapturesIncluded"
+        ]
+        is not False
+        or public_events["path"]
+        != "paper/evidence/w8-compatibility/sanitized-load-events.jsonl"
+        or public_events["sha256"] != sha256(W8_COMPATIBILITY_EVENTS_PATH)
+        or public_events["recordCount"] != len(w8_compatibility_events)
+        or public_events["manifestPath"]
+        != "paper/evidence/w8-compatibility/MANIFEST.sha256"
+        or public_events["manifestSHA256"]
+        != sha256(W8_COMPATIBILITY_MANIFEST_PATH)
+    ):
+        raise PipelineError("Sanitized W8 compatibility evidence metadata drift")
+    required_observations = {
+        "public-w8-old-producer-load-1",
+        "public-w8-old-producer-load-2-after-reboot",
+        "current-producer-w8-fresh-aot-load-1",
+    }
+    observation_items = w8_compatibility["loadCompatibilityObservations"]
+    observation_ids = [item["id"] for item in observation_items]
+    if len(observation_ids) != len(set(observation_ids)):
+        raise PipelineError("W8 compatibility observation IDs are not unique")
+    if set(observation_ids) != required_observations:
+        raise PipelineError("W8 compatibility observation set changed")
+    observations = {item["id"]: item for item in observation_items}
+    old_first = observations["public-w8-old-producer-load-1"]
+    old_second = observations["public-w8-old-producer-load-2-after-reboot"]
+    current = observations["current-producer-w8-fresh-aot-load-1"]
+    if old_first["artifact"] != old_second["artifact"]:
+        raise PipelineError("Old-public W8 attempts do not identify one artifact")
+    raw_old_first = w8_compatibility_events["public-w8-old-producer-load-1"]
+    raw_old_second = w8_compatibility_events[
+        "public-w8-old-producer-load-2-after-reboot"
+    ]
+    raw_current = w8_compatibility_events["current-producer-w8-fresh-aot-load-1"]
+    transition = w8_compatibility_events[
+        "full-reboot-request-and-reconnect-before-public-w8-load-2"
+    ]
+    source_digest_items = w8_compatibility["sourceEvidenceDigests"]
+    source_digest_names = [item["logicalName"] for item in source_digest_items]
+    if len(source_digest_names) != len(set(source_digest_names)):
+        raise PipelineError("W8 source-evidence logical names are not unique")
+    expected_source_digest_names = {
+        "current-toolchain-rebuild-report",
+        "current-producer-load-console-capture",
+        "current-producer-load-host-result",
+        "current-producer-candidate-identity",
+        "old-public-load-1-console-capture",
+        "old-public-load-1-host-result",
+        "old-public-load-2-console-capture",
+        "old-public-load-2-host-result",
+        "old-public-load-2-pre-reboot-device-list",
+        "old-public-load-2-reboot-command-result",
+        "old-public-load-2-reboot-command-stdout",
+        "old-public-load-2-post-reboot-device-list",
+        "old-public-load-2-subsequent-install-result",
+    }
+    if set(source_digest_names) != expected_source_digest_names:
+        raise PipelineError("W8 source-evidence digest inventory changed")
+    source_digests = {
+        item["logicalName"]: item["sha256"] for item in source_digest_items
+    }
+    if any(
+        re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        for digest in source_digests.values()
+    ):
+        raise PipelineError("W8 source-evidence digest is not canonical SHA-256")
+    event_source_digests = {
+        "old-public-load-1-console-capture": raw_old_first[
+            "sourceCaptureSHA256"
+        ],
+        "old-public-load-1-host-result": raw_old_first[
+            "sourceHostResultSHA256"
+        ],
+        "old-public-load-2-console-capture": raw_old_second[
+            "sourceCaptureSHA256"
+        ],
+        "old-public-load-2-host-result": raw_old_second[
+            "sourceHostResultSHA256"
+        ],
+        "current-producer-load-console-capture": raw_current[
+            "sourceCaptureSHA256"
+        ],
+        "current-producer-load-host-result": raw_current[
+            "sourceHostResultSHA256"
+        ],
+        "old-public-load-2-pre-reboot-device-list": transition[
+            "sourceDigests"
+        ]["preRequestDeviceListSHA256"],
+        "old-public-load-2-reboot-command-result": transition[
+            "sourceDigests"
+        ]["rebootCommandHostResultSHA256"],
+        "old-public-load-2-reboot-command-stdout": transition[
+            "sourceDigests"
+        ]["rebootCommandStdoutSHA256"],
+        "old-public-load-2-post-reboot-device-list": transition[
+            "sourceDigests"
+        ]["postRequestDeviceListSHA256"],
+        "old-public-load-2-subsequent-install-result": transition[
+            "sourceDigests"
+        ]["subsequentInstallHostResultSHA256"],
+    }
+    if any(
+        source_digests[name] != digest
+        for name, digest in event_source_digests.items()
+    ):
+        raise PipelineError("Sanitized W8 source-evidence digest mapping drift")
+    summary_environment = w8_compatibility["testEnvironment"]
+    expected_event_environment = {
+        "productType": summary_environment["device"]["productType"],
+        "reality": summary_environment["device"]["reality"],
+        "operatingSystemVersion": summary_environment["operatingSystem"]["version"],
+        "operatingSystemBuild": summary_environment["operatingSystem"]["build"],
+    }
+    for raw in (raw_old_first, raw_old_second, raw_current):
+        if raw["deviceRef"] != "test-device-1":
+            raise PipelineError("Sanitized W8 device binding drift")
+        if raw["environment"] != expected_event_environment:
+            raise PipelineError("Sanitized W8 environment binding drift")
+    for summary, raw in (
+        (old_first, raw_old_first),
+        (old_second, raw_old_second),
+        (current, raw_current),
+    ):
+        for field in (
+            "revision",
+            "sourceHashSHA256",
+            "compiledMainSHA256",
+            "artifactManifestSHA256",
+            "producer",
+        ):
+            if summary["artifact"][field] != raw["artifact"][field]:
+                raise PipelineError(
+                    f"Sanitized W8 compatibility artifact drift: {summary['id']}/{field}"
+                )
+        if summary["protocol"]["generationPerformed"] is not False:
+            raise PipelineError("W8 compatibility summary contains generation")
+        if raw["protocol"]["generationPerformed"] is not False:
+            raise PipelineError("Sanitized W8 compatibility event contains generation")
+        if summary["protocol"]["timedPerformanceSample"] is not False:
+            raise PipelineError("W8 compatibility summary contains a timing sample")
+        if raw["protocol"]["timedPerformanceSample"] is not False:
+            raise PipelineError("Sanitized W8 event contains a timing sample")
+        if summary["protocol"]["instrumentsTracePerformed"] is not False:
+            raise PipelineError("W8 compatibility summary contains an Instruments trace")
+        if raw["protocol"]["instrumentsTracePerformed"] is not False:
+            raise PipelineError("Sanitized W8 event contains an Instruments trace")
+    for summary, raw in (
+        (old_first, raw_old_first),
+        (old_second, raw_old_second),
+    ):
+        result = summary["result"]
+        event = raw["consoleEvent"]
+        if (
+            result["failureStage"] != event["failureStage"]
+            or result["osStatus"] != event["osStatus"]
+            or result["aneCompileStatus"] != event["aneCompileStatus"]
+            or result["heapAllocationAssertion"] != event["heapAllocationAssertion"]
+            or result["terminationSignal"]
+            != raw["hostTermination"]["terminatingSignal"]
+        ):
+            raise PipelineError(f"Sanitized W8 failure event drift: {summary['id']}")
+    if (
+        raw_current["consoleEvent"]["status"] != "passed"
+        or raw_current["consoleEvent"]["loadSeconds"]
+        != current["result"]["loadSeconds"]
+        or raw_current["consoleEvent"]["memoryAfterUnload"]["peakResidentMiB"]
+        != current["result"]["memoryAfterUnload"]["peakProcessResidentMiB"]
+        or raw_current["consoleEvent"]["unloadStatus"]
+        != current["result"]["unloadStatus"]
+        or raw_current["hostTermination"]["exitCode"]
+        != current["result"]["termination"]["exitCode"]
+        or raw_current["protocol"]["timedPerformanceSample"] is not False
+        or raw_current["protocol"]["aneExecutionMeasured"] is not False
+        or current["protocol"]["timedPerformanceSample"] is not False
+        or current["protocol"]["instrumentsTracePerformed"] is not False
+        or raw_current["protocol"]["instrumentsTracePerformed"] is not False
+        or current["protocol"]["aneExecutionMeasured"] is not False
+        or current["protocol"]["plannedLaunchCount"] != 1
+        or current["protocol"]["completedLaunchCount"] != 1
+        or current["protocol"]["retryPerformed"] is not False
+        or raw_current["protocol"]["plannedLaunchCount"]
+        != current["protocol"]["plannedLaunchCount"]
+        or raw_current["protocol"]["completedLaunchCount"]
+        != current["protocol"]["completedLaunchCount"]
+        or raw_current["protocol"]["retryPerformed"]
+        != current["protocol"]["retryPerformed"]
+    ):
+        raise PipelineError("Sanitized current-toolchain W8 load event drift")
+    if (
+        transition["linkedLoadRecordID"] != old_second["id"]
+        or transition["deviceRef"] != "test-device-1"
+        or transition["request"]["requestedStyle"] != "full"
+        or transition["request"]["hostOutcome"] != "timeout"
+        or transition["subsequentObservation"]["postBootState"] != "booted"
+        or transition["subsequentObservation"]["postConnectionState"]
+        != "connected"
+        or transition["evidenceBoundary"]["completedRebootDirectlyVerified"]
+        is not False
+        or old_second["protocol"][
+            "afterFullRebootRequestAndReconnectObservation"
+        ]
+        is not True
+    ):
+        raise PipelineError("Sanitized W8 reboot-request boundary drift")
+    if any(
+        item["protocol"]["generationPerformed"]
+        for item in (old_first, old_second, current)
+    ):
+        raise PipelineError("Load-only compatibility evidence contains generation")
+    if any(
+        item["result"].get("failureStage") != "ANECCompileOffline"
+        for item in (old_first, old_second)
+    ):
+        raise PipelineError("Unexpected old-public W8 failure stage")
+    if current["result"]["status"] != "passed":
+        raise PipelineError("Current-toolchain W8 compatibility load did not pass")
+    generation = w8_compatibility["currentToolchainArtifactGeneration"]
+    repeated_exports = generation["repeatedAuthoringExports"]
+    current_aot = generation["neuralEngineAOT"]
+    if not (
+        repeated_exports["first"]["mainMLIRBSHA256"]
+        == current_aot["sourceHashSHA256"]
+        == current["artifact"]["sourceHashSHA256"]
+    ):
+        raise PipelineError("Current W8 authoring-model identity binding drift")
+    if (
+        current_aot["compiledMainSHA256"]
+        != current["artifact"]["compiledMainSHA256"]
+        or current_aot["producer"] != current["artifact"]["producer"]
+    ):
+        raise PipelineError("Current W8 AOT identity binding drift")
+    export_hashes_equal = (
+        repeated_exports["first"]["mainMLIRBSHA256"]
+        == repeated_exports["second"]["mainMLIRBSHA256"]
+    )
+    if repeated_exports["rawByteEquality"] != export_hashes_equal:
+        raise PipelineError("Repeated W8 export equality field drift")
+    observed_size_difference = abs(
+        repeated_exports["first"]["mainMLIRBBytes"]
+        - repeated_exports["second"]["mainMLIRBBytes"]
+    )
+    if repeated_exports["sizeDifferenceBytes"] != observed_size_difference:
+        raise PipelineError("Repeated W8 export size-difference field drift")
 
     t2 = {
         "schemaVersion": 1,
@@ -500,12 +1943,29 @@ def generate_tables(
     }
     write_json(tables_dir / "t2-profile-definitions.json", t2)
 
+    if not w8_fidelity["historical_relationship"][
+        "supersedes_historical_mismatched_fidelity_values"
+    ]:
+        raise PipelineError("fidelity-v2 summary does not supersede historical values")
     t3 = {
-        "schemaVersion": 1,
-        "mechanism": w8_quality["mechanism"],
-        "selectionEvidence": w8_quality["selection_evidence"],
-        "evaluations": w8_quality["evaluations"],
-        "claimBoundary": "Conversion fidelity under frozen inputs, not general capability",
+        "schemaVersion": 2,
+        "runID": w8_fidelity["run_id"],
+        "status": w8_fidelity["status"],
+        "mechanism": w8_fidelity["mechanism"],
+        "source": w8_fidelity["source"],
+        "protocol": w8_fidelity["protocol"],
+        "healthProbe": w8_fidelity["health_probe"],
+        "selectionEvidence": historical_w8_quality["selection_evidence"],
+        "evaluations": {
+            "w8_tuning": w8_fidelity["evaluations"]["tuning"],
+            "w8_frozen_holdout": w8_fidelity["evaluations"]["holdout"],
+        },
+        "historicalQualitySummary": {
+            "path": "results/quality-summary.json",
+            "status": "superseded_for_reported_fidelity_metrics",
+            "retainedUse": "historical W4 and mixed-W4/W8 selection evidence only",
+        },
+        "claimBoundary": w8_fidelity["claim_boundary"],
     }
     write_json(tables_dir / "t3-w8-fidelity.json", t3)
 
@@ -524,8 +1984,9 @@ def generate_tables(
     write_json(tables_dir / "t4-w8-device-evidence.json", t4)
 
     t5 = {
-        "schemaVersion": 1,
-        "sourceQualitySHA256": sha256(generated_dir / "quality-recomputed.json"),
+        "schemaVersion": 2,
+        "publishedQualitySHA256": sha256(generated_dir / "quality-recomputed.json"),
+        "paperAnalysisSHA256": sha256(generated_dir / "quality-analysis-v2.json"),
         "metric": quality["metric"],
         "variants": quality["variants"],
         "comparison": quality["comparison"],
@@ -548,8 +2009,9 @@ def generate_tables(
         ],
     )
 
+    speed_v2 = speed.get("schemaVersion") == 2
     t6 = {
-        "schemaVersion": 1,
+        "schemaVersion": 2 if speed_v2 else 1,
         "unit": "MiB",
         "measurements": {
             key: speed["storageAndMemory"][key]
@@ -557,6 +2019,16 @@ def generate_tables(
         },
         "rssMeaning": "Peak process resident memory in the disclosed benchmark",
     }
+    if speed_v2:
+        t6["source"] = speed["source"]
+        t6["measurementPolicy"] = {
+            "compiledModelBundleMiB": (
+                "identical estimatedDiskBytes in all four profile blocks, converted to MiB"
+            ),
+            "peakProcessResidentMiB": (
+                "maximum after-unload peakResidentMiB across four profile blocks"
+            ),
+        }
     write_json(tables_dir / "t6-size-rss.json", t6)
     write_csv(
         tables_dir / "t6-size-rss.csv",
@@ -568,39 +2040,143 @@ def generate_tables(
     )
 
     t7 = {
-        "schemaVersion": 1,
+        "schemaVersion": 2 if speed_v2 else 1,
         "workloads": speed["workloads"],
-        "samplePolicy": "one warm-up followed by three accepted measured samples",
+        "samplePolicy": (
+            "four profile blocks by five measured attempts: 20 completed samples "
+            "per profile and workload"
+            if speed_v2
+            else "one warm-up followed by three accepted measured samples"
+        ),
         "p95Claimed": False,
     }
+    if speed_v2:
+        t7["source"] = speed["source"]
+        t7["admission"] = speed["admission"]
     write_json(tables_dir / "t7-workload-performance.json", t7)
+
+    t8 = {
+        "schemaVersion": 1,
+        "source": {
+            "path": "results/w8-aot-compatibility-evidence.json",
+            "sha256": sha256(
+                REPOSITORY_ROOT / "results/w8-aot-compatibility-evidence.json"
+            ),
+        },
+        "environment": w8_compatibility["testEnvironment"],
+        "oldPublicArtifact": {
+            "revision": old_first["artifact"]["revision"],
+            "sourceHashSHA256": old_first["artifact"]["sourceHashSHA256"],
+            "compiledMainSHA256": old_first["artifact"]["compiledMainSHA256"],
+            "artifactManifestSHA256": old_first["artifact"][
+                "artifactManifestSHA256"
+            ],
+            "producer": old_first["artifact"]["producer"],
+            "attempts": 2,
+            "failureStage": "ANECCompileOffline",
+            "afterFullRebootRequestAndReconnectAttemptIncluded": old_second[
+                "protocol"
+            ]["afterFullRebootRequestAndReconnectObservation"],
+            "completedRebootDirectlyVerified": old_second["protocol"][
+                "rebootBoundaryEvidence"
+            ]["completedRebootDirectlyVerified"],
+        },
+        "currentCandidate": {
+            "sourceHashSHA256": current["artifact"]["sourceHashSHA256"],
+            "compiledMainSHA256": current["artifact"]["compiledMainSHA256"],
+            "artifactManifestSHA256": current["artifact"][
+                "artifactManifestSHA256"
+            ],
+            "completeArtifactFileListFingerprintSHA256": generation[
+                "neuralEngineAOT"
+            ]["completeArtifactFileListFingerprintSHA256"],
+            "producer": current["artifact"]["producer"],
+            "attempts": current["protocol"]["completedLaunchCount"],
+            "loadSeconds": current["result"]["loadSeconds"],
+            "peakProcessResidentMiB": current["result"]["memoryAfterUnload"][
+                "peakProcessResidentMiB"
+            ],
+            "processResidentAfterUnloadMiB": current["result"][
+                "memoryAfterUnload"
+            ]["processResidentMiB"],
+            "unloadStatus": current["result"]["unloadStatus"],
+            "exitCode": current["result"]["termination"]["exitCode"],
+        },
+        "repeatedAuthoringExports": {
+            "firstMainMLIRBSHA256": repeated_exports["first"]["mainMLIRBSHA256"],
+            "secondMainMLIRBSHA256": repeated_exports["second"]["mainMLIRBSHA256"],
+            "rawByteEquality": repeated_exports["rawByteEquality"],
+            "sizeDifferenceBytes": repeated_exports["sizeDifferenceBytes"],
+        },
+        "claimBoundary": {
+            "loadOnly": True,
+            "generationPerformed": False,
+            "instrumentsTracePerformed": False,
+            "coldStartBenchmarkClaimed": False,
+            "causeIsolated": False,
+            "performanceComparisonClaimed": False,
+        },
+    }
+    write_json(tables_dir / "t8-w8-compatibility.json", t8)
     t7_rows: list[list[object]] = []
-    for workload_id, workload in speed["workloads"].items():
-        for variant, medians in workload["medians"].items():
-            t7_rows.append(
-                [
-                    workload_id,
-                    workload["inputTokens"],
-                    workload["outputTokens"],
-                    variant,
-                    medians.get("ttftSeconds"),
-                    medians.get("totalSeconds"),
-                    medians.get("visibleDecodeTokensPerSecond"),
-                    medians.get("endToEndOutputTokensPerSecond"),
-                ]
-            )
+    if speed_v2:
+        for workload_id, workload in speed["workloads"].items():
+            for variant, cell in workload["profiles"].items():
+                metrics = cell["metrics"]
+                t7_rows.append(
+                    [
+                        workload_id,
+                        metrics["inputTokens"]["median"],
+                        metrics["outputTokens"]["median"],
+                        variant,
+                        metrics["tokenTTFTSeconds"]["median"],
+                        metrics["visibleTTFTSeconds"]["median"],
+                        metrics["totalSeconds"]["median"],
+                        metrics["visibleDecodeTokensPerSecond"]["median"],
+                        metrics["endToEndVisibleTokensPerSecond"]["median"],
+                    ]
+                )
+    else:
+        for workload_id, workload in speed["workloads"].items():
+            for variant, medians in workload["medians"].items():
+                t7_rows.append(
+                    [
+                        workload_id,
+                        workload["inputTokens"],
+                        workload["outputTokens"],
+                        variant,
+                        medians.get("ttftSeconds"),
+                        medians.get("totalSeconds"),
+                        medians.get("visibleDecodeTokensPerSecond"),
+                        medians.get("endToEndOutputTokensPerSecond"),
+                    ]
+                )
     write_csv(
         tables_dir / "t7-workload-performance.csv",
-        [
-            "workload",
-            "input_tokens",
-            "output_tokens",
-            "variant",
-            "median_ttft_seconds",
-            "median_total_seconds",
-            "median_visible_decode_tokens_per_second",
-            "median_end_to_end_output_tokens_per_second",
-        ],
+        (
+            [
+                "workload",
+                "input_tokens",
+                "output_tokens",
+                "variant",
+                "median_token_ttft_seconds",
+                "median_visible_ttft_seconds",
+                "median_total_seconds",
+                "median_visible_decode_tokens_per_second",
+                "median_end_to_end_visible_tokens_per_second",
+            ]
+            if speed_v2
+            else [
+                "workload",
+                "input_tokens",
+                "output_tokens",
+                "variant",
+                "median_ttft_seconds",
+                "median_total_seconds",
+                "median_visible_decode_tokens_per_second",
+                "median_end_to_end_output_tokens_per_second",
+            ]
+        ),
         t7_rows,
     )
 
@@ -613,10 +2189,21 @@ def svg_document(width: int, height: int, body: str) -> str:
         '<style>text{font-family:-apple-system,BlinkMacSystemFont,"Helvetica Neue",Arial,sans-serif;fill:#161616}'
         '.title{font-size:24px;font-weight:700}.label{font-size:15px}.small{font-size:12px;fill:#555}'
         '.axis{stroke:#777;stroke-width:1}.grid{stroke:#ddd;stroke-width:1}.w8{fill:#d94a42}.int4{fill:#315b9a}'
-        '.w8point{fill:#fff;stroke:#8f211b;stroke-width:2}.int4point{fill:#fff;stroke:#173b73;stroke-width:2}'
+        '.w8point{fill:#fff;fill-opacity:.58;stroke:#8f211b;stroke-width:1.25}'
+        '.int4point{fill:#fff;fill-opacity:.58;stroke:#173b73;stroke-width:1.25}'
         '</style>\n'
         f"{body}\n</svg>\n"
     )
+
+
+def speed_figure_axis_max(values: list[float]) -> float:
+    finite = [float(value) for value in values if math.isfinite(float(value))]
+    if not finite:
+        raise PipelineError("Cannot scale a speed figure without finite observations")
+    maximum = max(finite)
+    if maximum <= 0.0:
+        return 1.0
+    return maximum * 1.08
 
 
 def generate_figures(quality: dict, speed: dict, generated_dir: Path) -> None:
@@ -664,48 +2251,105 @@ def generate_figures(quality: dict, speed: dict, generated_dir: Path) -> None:
         svg_document(width, height, "\n".join(f3_parts)), encoding="utf-8"
     )
 
-    workload_order = ["business_161_60", "near_4k_3790_10", "decode_120_256"]
-    workload_labels = ["161 / 60", "3,790 / 10", "120 / 256"]
+    speed_v2 = speed.get("schemaVersion") == 2
+    workload_order = (
+        list(SPEED_V2_WORKLOADS)
+        if speed_v2
+        else ["business_161_60", "near_4k_3790_10", "decode_120_256"]
+    )
+    workload_labels = (
+        ["Business medium", "Near-4K prefill", "256-token decode"]
+        if speed_v2
+        else ["161 / 60", "3,790 / 10", "120 / 256"]
+    )
     f4_parts = [
         '<text x="40" y="45" class="title">Workload-dependent latency</text>',
-        '<text x="40" y="70" class="small">Input / output tokens; bars are medians and circles are individual accepted samples</text>',
+        (
+            '<text x="40" y="70" class="small">Bars are medians; circles are all 20 protocol-admitted observations per cell</text>'
+            if speed_v2
+            else '<text x="40" y="70" class="small">Input / output tokens; bars are medians and circles are individual accepted samples</text>'
+        ),
     ]
 
+    def speed_median(workload: str, variant: str, field: str) -> float:
+        if speed_v2:
+            return speed["workloads"][workload]["profiles"][variant]["metrics"][field][
+                "median"
+            ]
+        return speed["workloads"][workload]["medians"][variant][field]
+
+    def speed_observations(workload: str, variant: str, field: str) -> list[float]:
+        if speed_v2:
+            return [
+                observation["value"]
+                for observation in speed["workloads"][workload]["profiles"][variant][
+                    "metrics"
+                ][field]["values"]
+            ]
+        return [
+            sample[field]
+            for sample in speed["workloads"][workload]["acceptedSamples"]
+            if sample["variant"] == variant
+        ]
+
     def bar_panel(field: str, title: str, top: int, panel_height: int) -> None:
-        values = [
-            speed["workloads"][workload]["medians"][variant][field]
+        medians = [
+            speed_median(workload, variant, field)
             for workload in workload_order
             for variant in ("W8_ANE", "INT4_GPU")
         ]
-        maximum_value = max(values) * 1.12
+        observations = [
+            value
+            for workload in workload_order
+            for variant in ("W8_ANE", "INT4_GPU")
+            for value in speed_observations(workload, variant, field)
+        ]
+        maximum_value = speed_figure_axis_max(medians + observations)
         base_y = top + panel_height
+        plot_height = panel_height - 35
+        plot_top = base_y - plot_height
         f4_parts.append(f'<text x="40" y="{top - 12}" class="label">{html.escape(title)}</text>')
-        f4_parts.append(f'<line x1="90" y1="{base_y}" x2="1040" y2="{base_y}" class="axis"/>')
+        for tick_index in range(5):
+            tick_value = maximum_value * tick_index / 4
+            tick_y = base_y - tick_index * plot_height / 4
+            f4_parts.append(
+                f'<line x1="90" y1="{tick_y:.2f}" x2="1040" y2="{tick_y:.2f}" class="grid"/>'
+            )
+            f4_parts.append(
+                f'<text x="82" y="{tick_y + 4:.2f}" text-anchor="end" class="small">{tick_value:.2f}</text>'
+            )
+        f4_parts.append(
+            f'<line x1="90" y1="{plot_top}" x2="90" y2="{base_y}" class="axis"/>'
+        )
         group_width = 290
         for index, (workload, label) in enumerate(zip(workload_order, workload_labels)):
             center = 215 + index * group_width
             for offset, variant, css in ((-38, "W8_ANE", "w8"), (38, "INT4_GPU", "int4")):
-                value = speed["workloads"][workload]["medians"][variant][field]
+                value = speed_median(workload, variant, field)
                 bar_height = value / maximum_value * (panel_height - 35)
                 x = center + offset - 25
                 y = base_y - bar_height
                 f4_parts.append(f'<rect x="{x}" y="{y:.2f}" width="50" height="{bar_height:.2f}" class="{css}"/>')
-                samples = [
-                    sample[field]
-                    for sample in speed["workloads"][workload]["acceptedSamples"]
-                    if sample["variant"] == variant
-                ]
+                samples = speed_observations(workload, variant, field)
                 point_css = f"{css}point"
-                for point_offset, sample in zip((-12, 0, 12), samples):
+                point_spacing = min(12.0, 48.0 / max(1, len(samples) - 1))
+                first_offset = -point_spacing * (len(samples) - 1) / 2
+                for sample_index, sample in enumerate(samples):
+                    point_offset = first_offset + sample_index * point_spacing
                     sample_y = base_y - sample / maximum_value * (panel_height - 35)
                     f4_parts.append(
                         f'<circle cx="{center + offset + point_offset}" cy="{sample_y:.2f}" '
-                        f'r="4.5" class="{point_css}"/>'
+                        f'r="3" class="{point_css}"/>'
                     )
                 f4_parts.append(f'<text x="{center + offset}" y="{y - 6:.2f}" text-anchor="middle" class="small">{value:.3f}</text>')
             f4_parts.append(f'<text x="{center}" y="{base_y + 22}" text-anchor="middle" class="small">{label}</text>')
 
-    bar_panel("ttftSeconds", "Time to first token (seconds)", 125, 195)
+    bar_panel(
+        "tokenTTFTSeconds" if speed_v2 else "ttftSeconds",
+        "Token time to first token (seconds)" if speed_v2 else "Time to first token (seconds)",
+        125,
+        195,
+    )
     bar_panel("totalSeconds", "Total generation time (seconds)", 420, 195)
     f4_parts.extend(
         [
@@ -725,16 +2369,36 @@ def generate_figures(quality: dict, speed: dict, generated_dir: Path) -> None:
     f5_parts = [
         '<text x="40" y="48" class="title">Storage and peak process memory</text>',
         '<text x="40" y="75" class="small">MiB; RSS is process resident memory, not total system RAM</text>',
-        '<line x1="90" y1="420" x2="840" y2="420" class="axis"/>',
     ]
-    max_value = 3000.0
+    max_value = speed_figure_axis_max(
+        [
+            value
+            for _, values in metrics
+            for value in values.values()
+        ]
+    )
+    chart_top = 105
+    chart_bottom = 420
+    chart_height = chart_bottom - chart_top
+    for tick_index in range(5):
+        tick_value = max_value * tick_index / 4
+        tick_y = chart_bottom - tick_index * chart_height / 4
+        f5_parts.append(
+            f'<line x1="90" y1="{tick_y:.2f}" x2="840" y2="{tick_y:.2f}" class="grid"/>'
+        )
+        f5_parts.append(
+            f'<text x="82" y="{tick_y + 4:.2f}" text-anchor="end" class="small">{tick_value:.1f}</text>'
+        )
+    f5_parts.append(
+        f'<line x1="90" y1="{chart_top}" x2="90" y2="{chart_bottom}" class="axis"/>'
+    )
     for index, (label, values) in enumerate(metrics):
         center = 270 + index * 380
         for offset, variant, css in ((-55, "W8_ANE", "w8"), (55, "INT4_GPU", "int4")):
             value = values[variant]
-            bar_height = value / max_value * 300
+            bar_height = value / max_value * chart_height
             x = center + offset - 38
-            y = 420 - bar_height
+            y = chart_bottom - bar_height
             f5_parts.append(f'<rect x="{x}" y="{y:.2f}" width="76" height="{bar_height:.2f}" class="{css}"/>')
             f5_parts.append(f'<text x="{center + offset}" y="{y - 8:.2f}" text-anchor="middle" class="small">{value:,.1f}</text>')
         f5_parts.append(f'<text x="{center}" y="448" text-anchor="middle" class="label">{html.escape(label)}</text>')
@@ -753,12 +2417,7 @@ def write_generated_manifest(generated_dir: Path) -> None:
     manifest_path = generated_dir / "MANIFEST.sha256"
     entries = []
     for path in sorted(generated_dir.rglob("*")):
-        relative = path.relative_to(generated_dir)
-        if (
-            path.is_file()
-            and path != manifest_path
-            and not any(part.startswith(".") for part in relative.parts)
-        ):
+        if path.is_file() and path != manifest_path:
             entries.append(f"{sha256(path)}  {path.relative_to(generated_dir).as_posix()}")
     manifest_path.write_text("\n".join(entries) + "\n", encoding="utf-8")
 
@@ -787,12 +2446,7 @@ def validate_generated_manifest(generated_dir: Path) -> None:
     actual = {
         path.relative_to(generated_dir).as_posix()
         for path in generated_dir.rglob("*")
-        if path.is_file()
-        and path != manifest_path
-        and not any(
-            part.startswith(".")
-            for part in path.relative_to(generated_dir).parts
-        )
+        if path.is_file() and path != manifest_path
     }
     if listed != actual:
         missing = sorted(actual - listed)
@@ -802,9 +2456,12 @@ def validate_generated_manifest(generated_dir: Path) -> None:
         )
 
 
-def run_tests(generated_dir: Path) -> None:
+def run_tests(generated_dir: Path, *, allow_legacy_speed_schema: bool = False) -> None:
     environment = os.environ.copy()
     environment["ANALYSIS_GENERATED_DIR"] = str(generated_dir)
+    environment["ANALYSIS_ALLOW_LEGACY_SPEED_SCHEMA"] = (
+        "1" if allow_legacy_speed_schema else "0"
+    )
     subprocess.run(
         [
             sys.executable,
@@ -840,19 +2497,64 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--generated-dir", type=Path, default=DEFAULT_GENERATED_DIR)
+    parser.add_argument(
+        "--speed-evidence-dir",
+        type=Path,
+        help=(
+            "publication-only speed-v2 bundle containing exactly FINALIZED.json "
+            "and public/; required while the accepted-bundle source lock is empty"
+        ),
+    )
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--test-only", action="store_true")
     arguments = parser.parse_args()
 
     lock = read_json(LOCK_PATH)
     require_hash(PUBLIC_STATUS_PATH, lock["publicStatusLockSHA256"])
+    for relative_path, expected_hash in lock["localFiles"].items():
+        require_hash(REPOSITORY_ROOT / relative_path, expected_hash)
     verify_runtime(lock)
     generated_dir = resolve_generated_dir(arguments.generated_dir)
+    speed_admission = lock["speedV2Admission"]
+    accepted_speed_bundle = _accepted_speed_v2_spec(speed_admission)
     if arguments.test_only:
         validate_generated_manifest(generated_dir)
-        run_tests(generated_dir)
+        generated_speed = read_json_strict(generated_dir / "speed-normalized.json")
+        generated_speed_schema = generated_speed.get("schemaVersion")
+        _require_evidence(
+            generated_speed_schema in {1, 2},
+            "generated speed schema is unsupported",
+        )
+        allow_legacy_speed_schema = (
+            generated_speed_schema == 1 and accepted_speed_bundle is None
+        )
+        _require_evidence(
+            generated_speed_schema == 2 or allow_legacy_speed_schema,
+            "historical speed output is forbidden after a speed-v2 bundle is accepted",
+        )
+        run_tests(
+            generated_dir,
+            allow_legacy_speed_schema=allow_legacy_speed_schema,
+        )
         print("PIPELINE_TESTS_OK")
         return 0
+
+    if accepted_speed_bundle is None:
+        _require_evidence(
+            arguments.speed_evidence_dir is not None,
+            "--speed-evidence-dir is required until source-lock.json records an accepted bundle",
+        )
+        speed_bundle = (
+            arguments.speed_evidence_dir
+            if arguments.speed_evidence_dir.is_absolute()
+            else ROOT / arguments.speed_evidence_dir
+        ).resolve()
+    else:
+        _require_evidence(
+            arguments.speed_evidence_dir is None,
+            "--speed-evidence-dir cannot override the source-locked accepted bundle",
+        )
+        speed_bundle = _accepted_speed_v2_path(accepted_speed_bundle)
 
     work_dir = arguments.work_dir.resolve()
     repositories_dir = work_dir / "repositories"
@@ -894,7 +2596,11 @@ def main() -> int:
         dataset_path,
         generated_dir,
     )
-    speed = extract_speed(repository_paths["comparison"], generated_dir)
+    speed = extract_speed_v2(
+        speed_bundle,
+        generated_dir,
+        speed_admission,
+    )
     generate_tables(
         repository_paths["w8"],
         repository_paths["comparison"],
@@ -914,8 +2620,14 @@ def main() -> int:
         "repositoryCommits": {
             name: spec["commit"] for name, spec in lock["repositories"].items()
         },
-        "newModelOutputsCreated": False,
-        "newDeviceMeasurementsCreated": False,
+        "localFileSHA256": lock["localFiles"],
+        "pipelinePerformedModelInference": False,
+        "pipelinePerformedDeviceMeasurement": False,
+        "speedEvidence": speed["source"],
+        "incorporatesProspectiveSpeedV2": speed.get("schemaVersion") == 2,
+        "incorporatesAcceptedSpeedV2": accepted_speed_bundle is not None,
+        "incorporatesPostReviewAuthoringArtifactEvidence": True,
+        "incorporatesPostReviewDeviceEvidence": True,
     }
     write_json(generated_dir / "provenance.json", provenance)
     write_generated_manifest(generated_dir)
